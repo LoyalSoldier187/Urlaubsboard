@@ -1,0 +1,898 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Urlaubsplanung</title>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; }
+  #root { min-height: 100vh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo } = React;
+
+// ── localStorage-Shim (ersetzt window.storage der Claude-Umgebung) ──
+const storage = {
+  async get(key) {
+    try {
+      const v = localStorage.getItem(key);
+      return v == null ? null : { key, value: v };
+    } catch (e) { return null; }
+  },
+  async set(key, value) {
+    try { localStorage.setItem(key, value); return { key, value }; }
+    catch (e) { return null; }
+  },
+};
+
+
+// ── Design tokens ─────────────────────────────────────────────
+const T = {
+  ink: "#1f2933",
+  sub: "#5c6b7a",
+  line: "#e2e6ea",
+  bg: "#f6f7f9",
+  card: "#ffffff",
+  lead: "#0f6f74",      // Vorgesetzte – Petrol
+  leadSoft: "#e3f1f1",
+  staff: "#b7791f",     // Mitarbeiter – Bernstein
+  staffSoft: "#f8efdd",
+  cake: "#9c4f96",      // Geburtstage – Pflaume
+  cakeSoft: "#f2e6f1",
+  danger: "#b4443c",
+};
+
+const MONTHS = ["Januar","Februar","März","April","Mai","Juni","Juli","August","September","Oktober","November","Dezember"];
+const MONTHS_SHORT = ["Jan","Feb","Mär","Apr","Mai","Jun","Jul","Aug","Sep","Okt","Nov","Dez"];
+const WD = ["Mo","Di","Mi","Do","Fr","Sa","So"];
+const STORE_KEY = "urlaub:v1";
+const BDAY_KEY = "geburtstage:v1";
+const PEOPLE_KEY = "personen:v1";
+
+// Vorbelegte Namen aus der Liste
+const SEED_LEAD = ["Rout, Evgeniya", "Bahn, Marc", "Zerrou, Ayoub", "Valter, Julia", "Franjo, Denis"];
+const SEED_STAFF = ["Da Silva Antonio, Jose", "Degirmenci, Abdullah", "Khan, Emal", "Munteanu, Tatiana", "Ngoc Thanh Tuyen, Pham", "Philippi, Rene", "Dortmann, Irina", "Malah, Khalid", "Müller, Heike", "Tewelde, Amanuel", "Schuller, Milica", "Kunicke, Asta", "Barschtipan, Dustin", "Jung, Jaqueline", "Gacioppo, Fabio", "Kimmer, Timo", "Huduq, Osumani", "Dortmann, Marcel", "Pirschle, Benjamin", "Ponamarev, Alexander", "Roßtäuscher, Dennis", "Rout, Aleksej", "Schäfer, Denis", "Schneidmüller, Svetlana", "Schäfer, Valeria", "Walter, Oleg", "Geißler, Martina", "Harff, Rita", "Mangiapane, Francesco", "Haselsteiner, Gabriele", "Spegt-Sieben, Christine", "Khan, Fatima", "Ponomareva, Alena", "Brooks, Brigitte", "Schäfer, Elena", "Schäfer, Victor", "Dortmann, Alexander", "Schatz, Oksana", "Bajko, Alpar", "Schuster, Iris", "Fronia, Christine", "Hebling, Jennifer", "Farfar, Nadia", "Gundlach, Sandra", "Lendle, Susanne", "Gaudin-Hix, Patricia", "Assakali, Nassim", "Khalifi, Mariya", "Munschauer, Mandy", "Zouhair, Jamal Eddi", "Boulbahaiem, Anis", "Hummel, Petra", "Benjrid, Hicham", "Kaygusuz, Devrim", "Bouzayen, Iyad", "Diring, Milen", "Kuhlemann, Brian", "Semm, Yvonne", "Scholz-Zhang, Zhenfang", "Khan, Zarmina", "Heck, Inka", "Medlin, Birgit", "Di Vincenzo, Quirino"];
+
+function daysBetween(a, b) {
+  const d1 = new Date(a), d2 = new Date(b);
+  return Math.floor((d2 - d1) / 86400000) + 1;
+}
+function fmt(d) {
+  if (!d) return "";
+  const x = new Date(d);
+  return `${String(x.getDate()).padStart(2,"0")}.${String(x.getMonth()+1).padStart(2,"0")}.${x.getFullYear()}`;
+}
+function iso(x) {
+  return `${x.getFullYear()}-${String(x.getMonth()+1).padStart(2,"0")}-${String(x.getDate()).padStart(2,"0")}`;
+}
+function overlaps(e, from, to) {
+  return new Date(e.start) <= to && new Date(e.end) >= from;
+}
+function daysInRange(e, from, to) {
+  const s = new Date(e.start) < from ? from : new Date(e.start);
+  const en = new Date(e.end) > to ? to : new Date(e.end);
+  if (en < s) return 0;
+  return daysBetween(iso(s), iso(en));
+}
+
+function App() {
+  const [tab, setTab] = useState("lead");     // lead | staff | bday
+  const [view, setView] = useState("plan");   // plan | dash
+  const [year, setYear] = useState(new Date().getFullYear());
+  const [data, setData] = useState({ lead: [], staff: [] });        // Urlaubseinträge
+  const [people, setPeople] = useState({ lead: [], staff: [] });    // Personen (Namen)
+  const [bdays, setBdays] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+  const [form, setForm] = useState({ name: "", start: "", end: "", note: "", quota: "30" });
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await storage.get(STORE_KEY);
+        if (r && r.value) setData(JSON.parse(r.value));
+      } catch (e) {}
+      try {
+        const p = await storage.get(PEOPLE_KEY);
+        if (p && p.value) {
+          setPeople(JSON.parse(p.value));
+        } else {
+          // Erstbefüllung mit den Namen aus der Liste
+          const seed = {
+            lead: SEED_LEAD.map((n, i) => ({ id: `L${i}`, name: n, quota: 30 })),
+            staff: SEED_STAFF.map((n, i) => ({ id: `S${i}`, name: n, quota: 30 })),
+          };
+          setPeople(seed);
+          try { await storage.set(PEOPLE_KEY, JSON.stringify(seed)); } catch (e) {}
+        }
+      } catch (e) {}
+      try {
+        const b = await storage.get(BDAY_KEY);
+        if (b && b.value) setBdays(JSON.parse(b.value));
+      } catch (e) {}
+      setLoaded(true);
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!loaded) return;
+    (async () => { try { await storage.set(STORE_KEY, JSON.stringify(data)); } catch (e) {} })();
+  }, [data, loaded]);
+  useEffect(() => {
+    if (!loaded) return;
+    (async () => { try { await storage.set(PEOPLE_KEY, JSON.stringify(people)); } catch (e) {} })();
+  }, [people, loaded]);
+  useEffect(() => {
+    if (!loaded) return;
+    (async () => { try { await storage.set(BDAY_KEY, JSON.stringify(bdays)); } catch (e) {} })();
+  }, [bdays, loaded]);
+
+  const accent = tab === "lead" ? T.lead : tab === "staff" ? T.staff : T.cake;
+  const accentSoft = tab === "lead" ? T.leadSoft : tab === "staff" ? T.staffSoft : T.cakeSoft;
+  const list = tab === "bday" ? [] : data[tab];
+  const personList = tab === "bday" ? [] : people[tab];
+
+  const addEntry = () => {
+    if (!form.name.trim() || !form.start || !form.end) return;
+    if (new Date(form.end) < new Date(form.start)) return;
+    const entry = {
+      id: Date.now(), name: form.name.trim(),
+      start: form.start, end: form.end, note: form.note.trim(),
+      quota: Number(form.quota) || 30,
+    };
+    setData(d => ({ ...d, [tab]: [...d[tab], entry] }));
+    // Person automatisch anlegen, falls neu
+    setPeople(p => {
+      if (p[tab].some(x => x.name === entry.name)) return p;
+      return { ...p, [tab]: [...p[tab], { id: `${tab}${Date.now()}`, name: entry.name, quota: entry.quota }] };
+    });
+    setForm({ name: "", start: "", end: "", note: "", quota: form.quota });
+  };
+  const remove = (id) => setData(d => ({ ...d, [tab]: d[tab].filter(e => e.id !== id) }));
+
+  const addPerson = (name, quota) => {
+    const nm = name.trim();
+    if (!nm || people[tab].some(x => x.name === nm)) return;
+    setPeople(p => ({ ...p, [tab]: [...p[tab], { id: `${tab}${Date.now()}`, name: nm, quota: Number(quota) || 30 }] }));
+  };
+  const removePerson = (id) =>
+    setPeople(p => ({ ...p, [tab]: p[tab].filter(x => x.id !== id) }));
+  const updateQuota = (id, quota) =>
+    setPeople(p => ({ ...p, [tab]: p[tab].map(x => x.id === id ? { ...x, quota } : x) }));
+  // Namen aus der Vorlage nachladen (nur fehlende ergänzen, nichts überschreiben)
+  const loadSeed = () => {
+    setPeople(p => {
+      const merge = (existing, prefix, seedNames) => {
+        const have = new Set(existing.map(x => x.name));
+        const additions = seedNames
+          .filter(n => !have.has(n))
+          .map((n, i) => ({ id: `${prefix}seed${Date.now()}_${i}`, name: n, quota: 30 }));
+        return [...existing, ...additions];
+      };
+      return {
+        lead: merge(p.lead, "L", SEED_LEAD),
+        staff: merge(p.staff, "S", SEED_STAFF),
+      };
+    });
+  };
+
+  return (
+    <div style={{ minHeight: "100vh", background: T.bg, color: T.ink,
+      fontFamily: "'Inter', -apple-system, system-ui, sans-serif", padding: "0 0 60px" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Fraunces:opsz,wght@9..144,500;9..144,600&display=swap');
+        * { box-sizing: border-box; }
+        input, button, select { font-family: inherit; }
+        input:focus, select:focus { outline: 2px solid ${accent}; outline-offset: 1px; }
+        button:focus-visible { outline: 2px solid ${T.ink}; outline-offset: 2px; }
+        @media (prefers-reduced-motion: no-preference){ .bar{ transition: width .4s ease; } .barM{ transition: height .4s ease; } }
+      `}</style>
+
+      <header style={{ background: T.card, borderBottom: `1px solid ${T.line}`, padding: "22px 28px 0" }}>
+        <div style={{ maxWidth: 1040, margin: "0 auto" }}>
+          <h1 style={{ fontFamily: "'Fraunces', serif", fontSize: 26, fontWeight: 600, margin: 0, letterSpacing: "-0.01em" }}>
+            Urlaubsplanung
+          </h1>
+          <div style={{ display: "flex", gap: 4, marginTop: 18 }}>
+            {[
+              { k: "lead", label: "Vorgesetzte", c: T.lead },
+              { k: "staff", label: "Mitarbeiter", c: T.staff },
+              { k: "bday", label: "Geburtstage", c: T.cake },
+            ].map(t => (
+              <button key={t.k} onClick={() => setTab(t.k)}
+                style={{ border: "none", background: "none", cursor: "pointer",
+                  padding: "10px 18px 14px", fontSize: 15, fontWeight: 600,
+                  color: tab === t.k ? t.c : T.sub,
+                  borderBottom: `3px solid ${tab === t.k ? t.c : "transparent"}` }}>
+                {t.label}
+                <span style={{ marginLeft: 8, fontSize: 12, fontWeight: 600, color: T.sub,
+                  background: T.bg, borderRadius: 10, padding: "2px 7px" }}>
+                  {t.k === "bday" ? bdays.length : people[t.k].length}
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
+      </header>
+
+      {tab !== "bday" && (
+        <div style={{ background: T.card, borderBottom: `1px solid ${T.line}` }}>
+          <div style={{ maxWidth: 1040, margin: "0 auto", padding: "0 28px", display: "flex", gap: 22 }}>
+            {[
+              { k: "plan", label: "Planung" },
+              { k: "people", label: "Personen" },
+              { k: "dash", label: "Dashboard" },
+            ].map(v => (
+              <button key={v.k} onClick={() => setView(v.k)}
+                style={{ border: "none", background: "none", cursor: "pointer",
+                  padding: "12px 0", fontSize: 14, fontWeight: 600,
+                  color: view === v.k ? accent : T.sub,
+                  borderBottom: `2px solid ${view === v.k ? accent : "transparent"}` }}>
+                {v.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <main style={{ maxWidth: 1040, margin: "0 auto", padding: "28px 28px 0" }}>
+        {tab === "bday" ? (
+          <Birthdays bdays={bdays} setBdays={setBdays} accent={T.cake} accentSoft={T.cakeSoft} />
+        ) : view === "plan" ? (
+          <PlanView {...{ list, personList, year, setYear, form, setForm, addEntry, remove, accent, accentSoft }} />
+        ) : view === "people" ? (
+          <People {...{ tab, personList, addPerson, removePerson, updateQuota, loadSeed, accent, accentSoft }} />
+        ) : (
+          <Dashboard {...{ list, accent, accentSoft }} />
+        )}
+        <p style={{ fontSize: 12, color: T.sub, textAlign: "center", marginTop: 34 }}>
+          Vorgesetzte, Mitarbeiter und Geburtstage werden getrennt gespeichert. Daten bleiben pro Reiter erhalten.
+        </p>
+      </main>
+    </div>
+  );
+}
+
+// ── Personenverwaltung ────────────────────────────────────────
+function People({ tab, personList, addPerson, removePerson, updateQuota, loadSeed, accent, accentSoft }) {
+  const [name, setName] = useState("");
+  const [quota, setQuota] = useState("30");
+
+  const sorted = useMemo(
+    () => [...personList].sort((a,b) => a.name.localeCompare(b.name, "de")),
+    [personList]
+  );
+
+  return (
+    <>
+      <div style={{ display: "flex", gap: 14, alignItems: "center", marginBottom: 22, flexWrap: "wrap" }}>
+        <div style={{ background: T.card, border: `1px solid ${T.line}`, borderRadius: 12, padding: "14px 16px", minWidth: 150 }}>
+          <div style={{ fontFamily: "'Fraunces', serif", fontSize: 30, fontWeight: 600, color: accent, lineHeight: 1 }}>{personList.length}</div>
+          <div style={{ fontSize: 12, color: T.sub, marginTop: 4 }}>Personen</div>
+        </div>
+        {personList.length === 0 && (
+          <button onClick={loadSeed}
+            style={{ background: accent, color: "#fff", border: "none", borderRadius: 8,
+              padding: "12px 18px", fontSize: 14, fontWeight: 600, cursor: "pointer" }}>
+            Namensliste laden (68 Personen)
+          </button>
+        )}
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "minmax(0,320px) minmax(0,1fr)", gap: 22, alignItems: "start" }}>
+        <Card accent={accent}>
+          <SectionTitle>Person hinzufügen</SectionTitle>
+          <div style={{ display: "grid", gap: 10 }}>
+            <input placeholder="Nachname, Vorname" value={name}
+              onChange={e => setName(e.target.value)}
+              onKeyDown={e => { if (e.key === "Enter") { addPerson(name, quota); setName(""); } }}
+              style={inp} />
+            <label style={lbl}>Jahresanspruch (Tage)
+              <input type="number" min="0" value={quota}
+                onChange={e => setQuota(e.target.value)} style={inp} />
+            </label>
+            <button onClick={() => { addPerson(name, quota); setName(""); }}
+              style={{ background: accent, color: "#fff", border: "none", borderRadius: 8,
+                padding: "11px", fontSize: 15, fontWeight: 600, cursor: "pointer" }}>
+              Hinzufügen
+            </button>
+          </div>
+        </Card>
+
+        <Card accent={accent}>
+          <SectionTitle>Personen ({sorted.length})</SectionTitle>
+          {sorted.length === 0 ? (
+            <Empty>Noch keine Personen angelegt.</Empty>
+          ) : (
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(270px,1fr))", gap: 8 }}>
+              {sorted.map(p => (
+                <div key={p.id} style={{ display: "flex", alignItems: "center", gap: 8,
+                  background: T.card, border: `1px solid ${T.line}`, borderRadius: 8, padding: "8px 11px" }}>
+                  <span style={{ flex: 1, fontSize: 14, fontWeight: 500, minWidth: 0,
+                    overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.name}</span>
+                  <span style={{ display: "flex", alignItems: "center", gap: 3, flexShrink: 0 }}
+                    title="Urlaubsanspruch (Tage/Jahr)">
+                    <input type="number" min="0" value={p.quota}
+                      onChange={e => updateQuota(p.id, e.target.value === "" ? "" : Number(e.target.value))}
+                      onBlur={e => { if (e.target.value === "") updateQuota(p.id, 0); }}
+                      style={{ width: 48, border: `1px solid ${T.line}`, borderRadius: 6,
+                        padding: "4px 6px", fontSize: 13, fontWeight: 600, color: accent, textAlign: "center" }} />
+                    <span style={{ fontSize: 11, color: T.sub }}>T.</span>
+                  </span>
+                  <span style={{ display: "flex", gap: 4, flexShrink: 0 }}>
+                    <button onClick={() => removePerson(p.id)} title="Löschen"
+                      style={{ border: "none", background: "none", color: T.danger, cursor: "pointer",
+                        fontSize: 16, lineHeight: 1, padding: "0 2px" }}>×</button>
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </Card>
+      </div>
+    </>
+  );
+}
+
+// ── Geburtstage ───────────────────────────────────────────────
+function Birthdays({ bdays, setBdays, accent, accentSoft }) {
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const [form, setForm] = useState({ name: "", date: "" });
+
+  const add = () => {
+    if (!form.name.trim() || !form.date) return;
+    const d = new Date(form.date);
+    setBdays(b => [...b, {
+      id: Date.now(), name: form.name.trim(),
+      date: form.date, month: d.getMonth(), day: d.getDate(), birthYear: d.getFullYear(),
+    }]);
+    setForm({ name: "", date: "" });
+  };
+  const remove = (id) => setBdays(b => b.filter(x => x.id !== id));
+
+  const withNext = useMemo(() => bdays.map(b => {
+    let next = new Date(now.getFullYear(), b.month, b.day);
+    if (next < today) next = new Date(now.getFullYear() + 1, b.month, b.day);
+    const daysUntil = Math.round((next - today) / 86400000);
+    const turning = next.getFullYear() - b.birthYear;
+    const isToday = b.month === now.getMonth() && b.day === now.getDate();
+    return { ...b, next, daysUntil, turning, isToday };
+  }), [bdays]);
+
+  const upcoming = useMemo(() => [...withNext].sort((a,b) => a.daysUntil - b.daysUntil), [withNext]);
+
+  const byMonth = useMemo(() => {
+    const m = Array.from({ length: 12 }, () => []);
+    bdays.forEach(b => m[b.month].push(b));
+    m.forEach(arr => arr.sort((a,b) => a.day - b.day));
+    return m;
+  }, [bdays]);
+
+  const thisMonthCount = byMonth[now.getMonth()].length;
+
+  return (
+    <>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))", gap: 14, marginBottom: 22 }}>
+        <Stat label="Geburtstage gesamt" value={bdays.length} accent={accent} />
+        <Stat label="Diesen Monat" value={thisMonthCount} accent={accent} />
+        <Stat label="Nächster in Tagen" value={upcoming.length ? upcoming[0].daysUntil : "–"} accent={accent} />
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "minmax(0,320px) minmax(0,1fr)", gap: 22, alignItems: "start" }}>
+        <div>
+          <Card accent={accent}>
+            <SectionTitle>Geburtstag eintragen</SectionTitle>
+            <div style={{ display: "grid", gap: 10 }}>
+              <input placeholder="Name" value={form.name}
+                onChange={e => setForm({ ...form, name: e.target.value })} style={inp} />
+              <label style={lbl}>Geburtsdatum
+                <input type="date" value={form.date}
+                  onChange={e => setForm({ ...form, date: e.target.value })} style={inp} />
+              </label>
+              <button onClick={add}
+                style={{ background: accent, color: "#fff", border: "none", borderRadius: 8,
+                  padding: "11px", fontSize: 15, fontWeight: 600, cursor: "pointer", marginTop: 2 }}>
+                Hinzufügen
+              </button>
+            </div>
+          </Card>
+
+          <div style={{ marginTop: 18 }}>
+            <SectionTitle>Als Nächstes</SectionTitle>
+            {upcoming.length === 0 ? (
+              <Empty>Noch keine Geburtstage eingetragen.</Empty>
+            ) : (
+              <div style={{ display: "grid", gap: 8 }}>
+                {upcoming.slice(0, 6).map(b => (
+                  <div key={b.id} style={{ background: T.card,
+                    border: `1px solid ${b.isToday ? accent : T.line}`,
+                    borderLeft: `3px solid ${accent}`, borderRadius: 10,
+                    padding: "11px 13px", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontWeight: 600, fontSize: 14 }}>
+                        {b.name}{b.isToday && <span style={{ marginLeft: 6, fontSize: 15 }}>🎂</span>}
+                      </div>
+                      <div style={{ fontSize: 12, color: T.sub }}>
+                        {String(b.day).padStart(2,"0")}.{String(b.month+1).padStart(2,"0")}. · wird {b.turning}
+                      </div>
+                    </div>
+                    <div style={{ fontWeight: 700, fontSize: 14, color: accent, flexShrink: 0 }}>
+                      {b.isToday ? "heute" : b.daysUntil === 1 ? "morgen" : `${b.daysUntil} T.`}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+
+        <Card accent={accent}>
+          <SectionTitle>Jahresübersicht</SectionTitle>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(150px,1fr))", gap: 14 }}>
+            {MONTHS.map((mName, mi) => {
+              const items = byMonth[mi];
+              const currentMonth = mi === now.getMonth();
+              return (
+                <div key={mi} style={{ border: `1px solid ${currentMonth ? accent : T.line}`,
+                  borderRadius: 10, padding: "10px 12px", background: currentMonth ? accentSoft : T.card }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 8 }}>
+                    <span style={{ fontFamily: "'Fraunces', serif", fontSize: 15, fontWeight: 600 }}>{mName}</span>
+                    {items.length > 0 && <span style={{ fontSize: 11, color: T.sub, fontWeight: 600 }}>{items.length}</span>}
+                  </div>
+                  {items.length === 0 ? (
+                    <div style={{ fontSize: 12, color: T.sub, opacity: 0.6 }}>–</div>
+                  ) : (
+                    <div style={{ display: "grid", gap: 5 }}>
+                      {items.map(b => {
+                        const isToday = currentMonth && b.day === now.getDate();
+                        return (
+                          <div key={b.id} style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 13 }}>
+                            <span style={{ fontWeight: 700, color: accent, minWidth: 20 }}>{String(b.day).padStart(2,"0")}.</span>
+                            <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                              fontWeight: isToday ? 700 : 500 }}>
+                              {b.name}{isToday && " 🎂"}
+                            </span>
+                            <button onClick={() => remove(b.id)} title="Löschen"
+                              style={{ border: "none", background: "none", color: T.sub, cursor: "pointer",
+                                fontSize: 15, lineHeight: 1, padding: 0, flexShrink: 0 }}>×</button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </Card>
+      </div>
+    </>
+  );
+}
+
+// ── Planungsansicht ───────────────────────────────────────────
+function PlanView({ list, personList, year, setYear, form, setForm, addEntry, remove, accent, accentSoft }) {
+  // Auswertung basiert auf ALLEN Personen (auch ohne Urlaub)
+  const summary = useMemo(() => {
+    const byName = {};
+    personList.forEach(p => { byName[p.name] = { name: p.name, taken: 0, quota: p.quota }; });
+    for (const e of list) {
+      if (new Date(e.start).getFullYear() !== year) continue;
+      if (!byName[e.name]) byName[e.name] = { name: e.name, taken: 0, quota: e.quota };
+      byName[e.name].taken += daysBetween(e.start, e.end);
+    }
+    return Object.values(byName).sort((a,b) => a.name.localeCompare(b.name, "de"));
+  }, [list, personList, year]);
+
+  const totalTaken = summary.reduce((s,p) => s + p.taken, 0);
+  const yearEntries = useMemo(
+    () => list.filter(e => new Date(e.start).getFullYear() === year)
+              .sort((a,b) => new Date(a.start) - new Date(b.start)),
+    [list, year]
+  );
+
+  const nameOptions = useMemo(
+    () => [...personList].map(p => p.name).sort((a,b) => a.localeCompare(b, "de")),
+    [personList]
+  );
+
+  return (
+    <>
+      <div style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 8, marginBottom: 18 }}>
+        <button onClick={() => setYear(y => y-1)} style={arrowBtn}>‹</button>
+        <span style={{ fontWeight: 600, fontSize: 16, minWidth: 52, textAlign: "center" }}>{year}</span>
+        <button onClick={() => setYear(y => y+1)} style={arrowBtn}>›</button>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))", gap: 14, marginBottom: 22 }}>
+        <Stat label="Personen" value={summary.length} accent={accent} />
+        <Stat label="Urlaubstage gesamt" value={totalTaken} accent={accent} />
+        <Stat label="Einträge" value={yearEntries.length} accent={accent} />
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "minmax(0,1.1fr) minmax(0,1fr)", gap: 22, alignItems: "start" }}>
+        <div>
+          <Card accent={accent}>
+            <SectionTitle>Urlaub eintragen</SectionTitle>
+            <div style={{ display: "grid", gap: 10 }}>
+              <input list="nameopts" placeholder="Name (aus Liste wählen oder tippen)" value={form.name}
+                onChange={e => {
+                  const p = personList.find(x => x.name === e.target.value);
+                  setForm({ ...form, name: e.target.value, quota: p ? String(p.quota) : form.quota });
+                }} style={inp} />
+              <datalist id="nameopts">
+                {nameOptions.map(n => <option key={n} value={n} />)}
+              </datalist>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                <label style={lbl}>Von
+                  <input type="date" value={form.start}
+                    onChange={e => setForm({ ...form, start: e.target.value })} style={inp} />
+                </label>
+                <label style={lbl}>Bis
+                  <input type="date" value={form.end}
+                    onChange={e => setForm({ ...form, end: e.target.value })} style={inp} />
+                </label>
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                <label style={lbl}>Jahresanspruch (Tage)
+                  <input type="number" min="0" value={form.quota}
+                    onChange={e => setForm({ ...form, quota: e.target.value })} style={inp} />
+                </label>
+                <label style={lbl}>Notiz
+                  <input placeholder="optional" value={form.note}
+                    onChange={e => setForm({ ...form, note: e.target.value })} style={inp} />
+                </label>
+              </div>
+              {form.start && form.end && new Date(form.end) >= new Date(form.start) && (
+                <div style={{ fontSize: 13, color: T.sub }}>
+                  = <b style={{ color: accent }}>{daysBetween(form.start, form.end)}</b> Tage
+                </div>
+              )}
+              <button onClick={addEntry}
+                style={{ background: accent, color: "#fff", border: "none", borderRadius: 8,
+                  padding: "11px", fontSize: 15, fontWeight: 600, cursor: "pointer", marginTop: 2 }}>
+                Hinzufügen
+              </button>
+            </div>
+          </Card>
+
+          <div style={{ marginTop: 18 }}>
+            <SectionTitle>Einträge {year}</SectionTitle>
+            {yearEntries.length === 0 ? (
+              <Empty>Noch keine Urlaube eingetragen. Leg oben los.</Empty>
+            ) : (
+              <div style={{ display: "grid", gap: 8 }}>
+                {yearEntries.map(e => (
+                  <div key={e.id} style={rowStyle}>
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontWeight: 600, fontSize: 14 }}>{e.name}</div>
+                      <div style={{ fontSize: 13, color: T.sub }}>
+                        {fmt(e.start)} – {fmt(e.end)} · {daysBetween(e.start, e.end)} T.
+                        {e.note && <span> · {e.note}</span>}
+                      </div>
+                    </div>
+                    <button onClick={() => remove(e.id)} style={delBtn}>Löschen</button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div>
+          <Card accent={accent}>
+            <SectionTitle>Auswertung pro Person</SectionTitle>
+            {summary.length === 0 ? (
+              <Empty>Keine Personen angelegt.</Empty>
+            ) : (
+              <div style={{ display: "grid", gap: 12, maxHeight: 620, overflowY: "auto", paddingRight: 4 }}>
+                {summary.map(p => {
+                  const pct = Math.min(100, Math.round((p.taken / p.quota) * 100));
+                  const over = p.taken > p.quota;
+                  return (
+                    <div key={p.name}>
+                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, marginBottom: 4 }}>
+                        <span style={{ fontWeight: 600 }}>{p.name}</span>
+                        <span style={{ color: over ? T.danger : T.sub, flexShrink: 0, marginLeft: 8 }}>
+                          {p.taken} / {p.quota} · {p.quota - p.taken} Rest
+                        </span>
+                      </div>
+                      <div style={{ height: 8, background: T.bg, borderRadius: 6, overflow: "hidden" }}>
+                        <div className="bar" style={{ width: `${pct}%`, height: "100%",
+                          background: over ? T.danger : accent, borderRadius: 6 }} />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </Card>
+        </div>
+      </div>
+    </>
+  );
+}
+
+// ── Dashboard ─────────────────────────────────────────────────
+function Dashboard({ list, accent, accentSoft }) {
+  const now = new Date();
+  const [year, setYear] = useState(now.getFullYear());
+  const [month, setMonth] = useState(now.getMonth());
+
+  const years = useMemo(() => {
+    const set = new Set([now.getFullYear()]);
+    list.forEach(e => { set.add(new Date(e.start).getFullYear()); set.add(new Date(e.end).getFullYear()); });
+    return Array.from(set).sort((a,b) => a-b);
+  }, [list]);
+
+  const from = month === -1 ? new Date(year, 0, 1) : new Date(year, month, 1);
+  const to   = month === -1 ? new Date(year, 11, 31) : new Date(year, month + 1, 0);
+
+  const inRange = useMemo(
+    () => list.filter(e => overlaps(e, from, to)).sort((a,b) => new Date(a.start) - new Date(b.start)),
+    [list, year, month]
+  );
+
+  const totalDays = inRange.reduce((s,e) => s + daysInRange(e, from, to), 0);
+  const people = new Set(inRange.map(e => e.name)).size;
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const outToday = list.filter(e => new Date(e.start) <= today && new Date(e.end) >= today).map(e => e.name);
+
+  const dayLoad = useMemo(() => {
+    if (month === -1) {
+      const m = Array(12).fill(0);
+      list.forEach(e => {
+        let cur = new Date(e.start), end = new Date(e.end);
+        while (cur <= end) { if (cur.getFullYear() === year) m[cur.getMonth()]++; cur = new Date(cur.getTime()+86400000); }
+      });
+      return m;
+    }
+    const dim = new Date(year, month+1, 0).getDate();
+    const d = Array(dim).fill(0);
+    list.forEach(e => {
+      let cur = new Date(e.start), end = new Date(e.end);
+      while (cur <= end) {
+        if (cur.getFullYear() === year && cur.getMonth() === month) d[cur.getDate()-1]++;
+        cur = new Date(cur.getTime()+86400000);
+      }
+    });
+    return d;
+  }, [list, year, month]);
+
+  return (
+    <>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "center", marginBottom: 22 }}>
+        <label style={lbl}>Jahr
+          <select value={year} onChange={e => setYear(Number(e.target.value))} style={sel}>
+            {years.map(y => <option key={y} value={y}>{y}</option>)}
+          </select>
+        </label>
+        <label style={lbl}>Monat
+          <select value={month} onChange={e => setMonth(Number(e.target.value))} style={sel}>
+            <option value={-1}>Ganzes Jahr</option>
+            {MONTHS.map((m,i) => <option key={i} value={i}>{m}</option>)}
+          </select>
+        </label>
+        <div style={{ marginLeft: "auto", fontSize: 13, color: T.sub }}>
+          Zeitraum: {fmt(iso(from))} – {fmt(iso(to))}
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))", gap: 14, marginBottom: 22 }}>
+        <Stat label="Urlaubstage im Zeitraum" value={totalDays} accent={accent} />
+        <Stat label="Personen im Urlaub" value={people} accent={accent} />
+        <Stat label="Einträge" value={inRange.length} accent={accent} />
+        <Stat label="Heute abwesend" value={outToday.length} accent={accent} />
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "minmax(0,1fr) minmax(0,1fr)", gap: 22, alignItems: "start" }}>
+        <Card accent={accent}>
+          <SectionTitle>{month === -1 ? "Belegung nach Monat" : "Belegung nach Tag"}</SectionTitle>
+          <BarRow data={dayLoad} accent={accent} accentSoft={accentSoft}
+            labels={month === -1 ? MONTHS_SHORT : dayLoad.map((_,i) => i+1)} />
+        </Card>
+
+        <Card accent={accent}>
+          <SectionTitle>{month === -1 ? "Übersicht" : "Kalender"}</SectionTitle>
+          {month === -1
+            ? <YearGrid list={list} year={year} accent={accent} accentSoft={accentSoft} />
+            : <MonthCalendar list={list} year={year} month={month} accent={accent} accentSoft={accentSoft} />}
+        </Card>
+      </div>
+
+      <div style={{ marginTop: 22 }}>
+        <Card accent={accent}>
+          <SectionTitle>Urlaube im Zeitraum</SectionTitle>
+          {inRange.length === 0 ? (
+            <Empty>Keine Urlaube in diesem Zeitraum.</Empty>
+          ) : (
+            <div style={{ display: "grid", gap: 8 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr 1fr 0.6fr 1.2fr",
+                gap: 10, fontSize: 11, fontWeight: 700, textTransform: "uppercase",
+                letterSpacing: "0.04em", color: T.sub, padding: "0 4px" }}>
+                <span>Name</span><span>Von</span><span>Bis</span><span>Tage</span><span>Notiz</span>
+              </div>
+              {inRange.map(e => {
+                const active = new Date(e.start) <= today && new Date(e.end) >= today;
+                return (
+                  <div key={e.id} style={{ display: "grid",
+                    gridTemplateColumns: "1.4fr 1fr 1fr 0.6fr 1.2fr", gap: 10, alignItems: "center",
+                    fontSize: 14, background: T.card, border: `1px solid ${T.line}`,
+                    borderLeft: `3px solid ${active ? accent : T.line}`,
+                    borderRadius: 8, padding: "10px 12px" }}>
+                    <span style={{ fontWeight: 600 }}>
+                      {e.name}
+                      {active && <span style={{ marginLeft: 6, fontSize: 10, fontWeight: 700,
+                        color: accent, background: accentSoft, padding: "1px 6px", borderRadius: 8 }}>im Urlaub</span>}
+                    </span>
+                    <span style={{ color: T.sub }}>{fmt(e.start)}</span>
+                    <span style={{ color: T.sub }}>{fmt(e.end)}</span>
+                    <span style={{ fontWeight: 600 }}>{daysInRange(e, from, to)}</span>
+                    <span style={{ color: T.sub, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{e.note || "–"}</span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </Card>
+      </div>
+    </>
+  );
+}
+
+function BarRow({ data, labels, accent, accentSoft }) {
+  const max = Math.max(1, ...data);
+  const many = data.length > 20;
+  return (
+    <div style={{ display: "flex", alignItems: "flex-end", gap: many ? 2 : 6, height: 130, marginTop: 6 }}>
+      {data.map((v, i) => (
+        <div key={i} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 4 }}>
+          {!many && <div style={{ fontSize: 10, color: T.sub, height: 12 }}>{v || ""}</div>}
+          <div style={{ width: "100%", height: 82, display: "flex", alignItems: "flex-end" }}>
+            <div className="barM" style={{ width: "100%", height: `${(v/max)*100}%`, minHeight: v ? 3 : 0,
+              background: accentSoft, borderTop: `3px solid ${accent}`, borderRadius: "2px 2px 0 0" }} />
+          </div>
+          <div style={{ fontSize: many ? 8 : 10, color: T.sub }}>{labels[i]}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function MonthCalendar({ list, year, month, accent, accentSoft }) {
+  const first = new Date(year, month, 1);
+  const startWd = (first.getDay() + 6) % 7;
+  const dim = new Date(year, month+1, 0).getDate();
+
+  const byDay = {};
+  list.forEach(e => {
+    let cur = new Date(e.start), end = new Date(e.end);
+    while (cur <= end) {
+      if (cur.getFullYear() === year && cur.getMonth() === month) {
+        const d = cur.getDate();
+        (byDay[d] = byDay[d] || []).push(e.name);
+      }
+      cur = new Date(cur.getTime()+86400000);
+    }
+  });
+
+  const cells = [];
+  for (let i = 0; i < startWd; i++) cells.push(null);
+  for (let d = 1; d <= dim; d++) cells.push(d);
+
+  const today = new Date();
+  const isToday = (d) => today.getFullYear()===year && today.getMonth()===month && today.getDate()===d;
+
+  return (
+    <div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(7,1fr)", gap: 4, marginBottom: 4 }}>
+        {WD.map(w => <div key={w} style={{ textAlign: "center", fontSize: 11, fontWeight: 700, color: T.sub }}>{w}</div>)}
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(7,1fr)", gap: 4 }}>
+        {cells.map((d, i) => {
+          if (d === null) return <div key={i} />;
+          const names = byDay[d];
+          const cnt = names ? names.length : 0;
+          const wd = (new Date(year, month, d).getDay()+6)%7;
+          const weekend = wd >= 5;
+          return (
+            <div key={i} title={names ? names.join(", ") : ""}
+              style={{ aspectRatio: "1", borderRadius: 7, display: "flex", flexDirection: "column",
+                alignItems: "center", justifyContent: "center", position: "relative",
+                fontSize: 12, fontWeight: 600,
+                background: cnt ? accentSoft : (weekend ? T.bg : T.card),
+                border: `1px solid ${isToday(d) ? accent : T.line}`,
+                color: cnt ? accent : (weekend ? T.sub : T.ink) }}>
+              {d}
+              {cnt > 0 && <span style={{ fontSize: 10, fontWeight: 700 }}>{cnt}</span>}
+            </div>
+          );
+        })}
+      </div>
+      <div style={{ display: "flex", gap: 16, marginTop: 12, fontSize: 12, color: T.sub }}>
+        <Legend color={accentSoft} border={accent} label="Urlaub (Zahl = Personen)" />
+        <Legend color={T.card} border={accent} label="Heute" />
+      </div>
+    </div>
+  );
+}
+
+function YearGrid({ list, year, accent, accentSoft }) {
+  const rows = MONTHS_SHORT.map((m, mi) => {
+    const names = new Set();
+    let days = 0;
+    list.forEach(e => {
+      let cur = new Date(e.start), end = new Date(e.end);
+      while (cur <= end) {
+        if (cur.getFullYear() === year && cur.getMonth() === mi) { days++; names.add(e.name); }
+        cur = new Date(cur.getTime()+86400000);
+      }
+    });
+    return { m, days, people: names.size };
+  });
+  const max = Math.max(1, ...rows.map(r => r.days));
+  return (
+    <div style={{ display: "grid", gap: 6 }}>
+      {rows.map((r, i) => (
+        <div key={i} style={{ display: "grid", gridTemplateColumns: "34px 1fr 78px", gap: 10, alignItems: "center" }}>
+          <span style={{ fontSize: 12, fontWeight: 600, color: T.sub }}>{r.m}</span>
+          <div style={{ height: 10, background: T.bg, borderRadius: 6, overflow: "hidden" }}>
+            <div className="bar" style={{ width: `${(r.days/max)*100}%`, height: "100%",
+              background: r.days ? accent : "transparent", borderRadius: 6 }} />
+          </div>
+          <span style={{ fontSize: 12, color: T.sub, textAlign: "right" }}>{r.days} T · {r.people} P</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+const inp = { width: "100%", border: `1px solid ${T.line}`, borderRadius: 8,
+  padding: "9px 11px", fontSize: 14, color: T.ink, background: "#fff" };
+const sel = { border: `1px solid ${T.line}`, borderRadius: 8, padding: "9px 11px",
+  fontSize: 14, color: T.ink, background: "#fff", minWidth: 130 };
+const lbl = { display: "grid", gap: 4, fontSize: 12, color: T.sub, fontWeight: 600 };
+const arrowBtn = { border: `1px solid ${T.line}`, background: "#fff", borderRadius: 8,
+  width: 32, height: 32, cursor: "pointer", fontSize: 18, color: T.ink, lineHeight: 1 };
+const rowStyle = { background: T.card, border: `1px solid ${T.line}`, borderRadius: 10,
+  padding: "12px 14px", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 };
+const delBtn = { border: "none", background: "none", color: T.danger, cursor: "pointer",
+  fontSize: 13, fontWeight: 600, flexShrink: 0 };
+
+function Card({ children, accent }) {
+  return <div style={{ background: T.card, border: `1px solid ${T.line}`,
+    borderRadius: 14, padding: 20, borderTop: `3px solid ${accent}` }}>{children}</div>;
+}
+function SectionTitle({ children }) {
+  return <h2 style={{ fontSize: 13, fontWeight: 700, textTransform: "uppercase",
+    letterSpacing: "0.05em", color: T.sub, margin: "0 0 14px" }}>{children}</h2>;
+}
+function Stat({ label, value, accent }) {
+  return <div style={{ background: T.card, border: `1px solid ${T.line}`, borderRadius: 12, padding: "14px 16px" }}>
+    <div style={{ fontFamily: "'Fraunces', serif", fontSize: 30, fontWeight: 600, color: accent, lineHeight: 1 }}>{value}</div>
+    <div style={{ fontSize: 12, color: T.sub, marginTop: 4 }}>{label}</div>
+  </div>;
+}
+function Empty({ children }) {
+  return <div style={{ background: T.card, border: `1px dashed ${T.line}`, borderRadius: 12,
+    padding: "22px 16px", textAlign: "center", fontSize: 14, color: T.sub }}>{children}</div>;
+}
+function Legend({ color, border, label }) {
+  return <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+    <span style={{ width: 13, height: 13, borderRadius: 4, background: color, border: `1px solid ${border}` }} />
+    {label}
+  </span>;
+}
+
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App />);
+</script>
+</body>
+</html>
